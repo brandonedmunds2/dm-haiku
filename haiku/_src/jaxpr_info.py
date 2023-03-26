@@ -30,15 +30,17 @@ Example usage:
     print(jaxpr_info.format_module(mod))
 
 """
+import contextlib
 import dataclasses
 import itertools
 import logging
 import os
 import sys
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Set, Sequence, Optional
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Set, Sequence, Optional, Tuple
 
 from haiku._src import summarise
 import jax
+from jax.experimental import maps
 
 
 @dataclasses.dataclass
@@ -102,11 +104,31 @@ class Expression:
 ComputeFlopsFn = Callable[[jax.core.JaxprEqn, Expression], int]
 
 
+# TODO(yashkatariya): Remove once jax.Array is ready
+@contextlib.contextmanager
+def _maybe_set_global_semantics():
+  """Sets global semantics within the context manager.
+
+  Required for evaluating make_jaxpr on GlobalDeviceArray values.
+
+  Yields:
+    No value, but a JAX environment which sets GLOBAL positional semantics.
+  """
+  prev_positional_val = maps._positional_semantics.val  # pylint: disable=protected-access
+  try:
+    if jax.config.jax_parallel_functions_output_gda:
+      maps._positional_semantics.val = maps._PositionalSemantics.GLOBAL  # pylint: disable=protected-access
+    yield
+  finally:
+    maps._positional_semantics.val = prev_positional_val  # pylint: disable=protected-access
+
+
 def make_model_info(
     f: Callable[..., Any],
     name: Optional[str] = None,
     include_module_info: bool = True,
     compute_flops: Optional[ComputeFlopsFn] = None,
+    axis_env: Optional[Sequence[Tuple[Any, int]]] = None,
 ) -> Callable[..., Module]:
   """Creates a function that computes flop, param and state information.
 
@@ -121,6 +143,7 @@ def make_model_info(
       information for haiku modules. Can be slow for very large computations.
     compute_flops: Optional, a function that returns an estimate of the number
       of flops required to execute an equation.
+    axis_env: Sizes of pmapped axes.  See docs of jax.make_jaxpr for details.
 
   Returns:
     A wrapped version of `f` that when applied to example arguments returns a
@@ -132,7 +155,7 @@ def make_model_info(
   """
   if not name:
     name = f.__name__
-  make_jaxpr = jax.make_jaxpr(f)
+  make_jaxpr = jax.make_jaxpr(f, axis_env=axis_env)
   if include_module_info:
     # Wrap f in a lambda so eval_summary doesn't try to un-transform it.
     # TODO(tomhennigan): remove lambda trick
@@ -145,21 +168,24 @@ def make_model_info(
       # Increase recursion limit as graphs may be very deep
       sys.setrecursionlimit(int(10e3))
 
+      with _maybe_set_global_semantics():
+        jaxpr = make_jaxpr(*args, **kwargs).jaxpr
+
       # Compute flops for all expressions.
       module = Module(name=name)
       _process_jaxpr(
-          make_jaxpr(*args, **kwargs).jaxpr,
+          jaxpr,
           compute_flops,
           scope=_ModuleScope(named_call_id='0'),
           seen=set(),
           module=module)
 
-      if jax.config.jax_experimental_name_stack:
-        _name_scopes_to_modules(module)
+      _name_scopes_to_modules(module)
 
       if include_module_info:
         # Add haiku param and state counts for all haiku modules.
-        module_infos = make_module_info(*args, **kwargs)
+        with _maybe_set_global_semantics():
+          module_infos = make_module_info(*args, **kwargs)
         by_name = {i.module_details.module.module_name: i for i in module_infos}
         by_name = {k.replace('/~/', '/'): v for k, v in by_name.items()}
 
